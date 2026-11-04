@@ -1,8 +1,9 @@
-using Dolphin.Memory.Access;
+﻿using Dolphin.Memory.Access;
 using System.Buffers.Binary;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Threading;
 using DolphinMemory = Dolphin.Memory.Access;
 
 namespace GameManager.Dolphin;
@@ -28,6 +29,31 @@ public sealed class DolphinConnection : IDisposable
     private IntPtr _writeHandle;
     private MEM2Extension? _mem2Extension;
     private bool _disposed;
+    private long _readCalls;
+    private long _readBytes;
+    private long _failedReads;
+    private long _pointerReads;
+
+    public (long Calls, long Bytes, long Failures, long PointerReads) GetReadStatistics() =>
+        (Interlocked.Read(ref _readCalls), Interlocked.Read(ref _readBytes),
+         Interlocked.Read(ref _failedReads), Interlocked.Read(ref _pointerReads));
+
+    public bool IsMemoryMapInitialized => _mem2Extension?.IsInitialized == true;
+
+    private long _readTicks;
+
+    /// <summary>Total wall-clock time spent inside TryRead (summed across threads).</summary>
+    public TimeSpan TotalReadTime =>
+        TimeSpan.FromSeconds(Interlocked.Read(ref _readTicks) / (double)Stopwatch.Frequency);
+
+    public void ResetReadStatistics()
+    {
+        Interlocked.Exchange(ref _readTicks, 0);
+        Interlocked.Exchange(ref _readCalls, 0);
+        Interlocked.Exchange(ref _readBytes, 0);
+        Interlocked.Exchange(ref _failedReads, 0);
+        Interlocked.Exchange(ref _pointerReads, 0);
+    }
 
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
@@ -158,16 +184,34 @@ public sealed class DolphinConnection : IDisposable
         ArgumentNullException.ThrowIfNull(buffer);
         bytesRead = 0;
 
-        if (!CanAccessProcess() || buffer.Length == 0)
-            return false;
+        Interlocked.Increment(ref _readCalls);
+        long startTicks = Stopwatch.GetTimestamp();
+        try
+        {
+            if (!CanAccessProcess() || buffer.Length == 0)
+            {
+                Interlocked.Increment(ref _failedReads);
+                return false;
+            }
 
-        if (!TryTranslateAddress(address, buffer.Length, out IntPtr hostAddress))
-            return false;
+            if (!TryTranslateAddress(address, buffer.Length, out IntPtr hostAddress))
+            {
+                Interlocked.Increment(ref _failedReads);
+                return false;
+            }
 
-        bool success = ReadProcessMemory(
-            _readHandle, hostAddress, buffer, buffer.Length, ref bytesRead);
+            bool success = ReadProcessMemory(
+                _readHandle, hostAddress, buffer, buffer.Length, ref bytesRead);
+            Interlocked.Add(ref _readBytes, bytesRead);
+            if (!success || bytesRead != buffer.Length)
+                Interlocked.Increment(ref _failedReads);
 
-        return success && bytesRead == buffer.Length;
+            return success && bytesRead == buffer.Length;
+        }
+        finally
+        {
+            Interlocked.Add(ref _readTicks, Stopwatch.GetTimestamp() - startTicks);
+        }
     }
 
     public bool TryWrite(IntPtr address, byte[] data, out int bytesWritten)
@@ -190,6 +234,7 @@ public sealed class DolphinConnection : IDisposable
     public bool TryReadPointer(IntPtr address, int offset, out IntPtr pointer)
     {
         pointer = IntPtr.Zero;
+        Interlocked.Increment(ref _pointerReads);
 
         if (!TryAddAddress(address, offset, out IntPtr targetAddress))
             return false;
@@ -204,9 +249,6 @@ public sealed class DolphinConnection : IDisposable
 
         uint value = BinaryPrimitives.ReadUInt32BigEndian(buffer);
         pointer = new IntPtr(value);
-
-        Console.WriteLine(
-            $"Read pointer 0x{targetAddress.ToInt64():X8} -> 0x{pointer.ToInt64():X8}");
 
         return value != 0;
     }
@@ -414,15 +456,21 @@ public sealed class DolphinConnection : IDisposable
         // Prefer DME-compatible discovered mappings for MEM1.
         if (address >= Mem1Base && address < Mem2Base)
         {
-            if (_mem2Extension?.IsInitialized == true)
+            if (_mem2Extension is not null)
             {
+                // Always try the extension first: it is pure arithmetic once the
+                // map is known, and it lazily discovers the map if the caller
+                // (e.g. a child process) never called InitializeMemoryMap().
+                if (_mem2Extension.TryTranslateAddress(emulatedAddress, length, out hostAddress))
+                    return true;
+
                 // Once the actual MEM1 size is known, do not fall back for an
                 // address outside that range.
-                return _mem2Extension.TryTranslateAddress(
-                    emulatedAddress, length, out hostAddress);
+                if (_mem2Extension.IsInitialized)
+                    return false;
             }
 
-            // Retain the package as a MEM1 fallback before discovery succeeds.
+            // Slow third-party fallback, only used while discovery has not succeeded.
             return _dolphin.TryGetAddress(emulatedAddress, out hostAddress);
         }
 
