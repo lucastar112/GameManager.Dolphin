@@ -319,7 +319,7 @@ public sealed class DolphinConnection : IDisposable
                 return false;
             }
 
-            Console.WriteLine(
+            DolphinLog.Debug(
                 $"[PointerChain] Offset {offsets[i]} -> 0x{currentAddress.ToInt64():X8}");
 
             if (i == offsets.Count - 1)
@@ -333,7 +333,7 @@ public sealed class DolphinConnection : IDisposable
             }
 
             currentAddress = nextAddress;
-            Console.WriteLine(
+            DolphinLog.Debug(
                 $"[PointerChain] Dereferenced -> 0x{currentAddress.ToInt64():X8}");
         }
 
